@@ -19,13 +19,15 @@ use registry::{Registry, Ns};
 use std::io::IoResult;
 
 #[allow(missing_copy_implementations)]
-pub struct StaticGenerator;
+pub struct StaticStructGenerator;
 
-impl super::Generator for StaticGenerator {
+impl super::Generator for StaticStructGenerator {
     fn write<W>(&self, registry: &Registry, ns: Ns, dest: &mut W) -> IoResult<()> where W: Writer {
         try!(write_header(dest));
         try!(write_type_aliases(&ns, dest));
         try!(write_enums(registry, dest));
+        try!(write_struct(&ns, dest));
+        try!(write_impl(registry, &ns, dest));
         try!(write_fns(registry, &ns, dest));
         Ok(())
     }
@@ -71,6 +73,57 @@ fn write_enums<W>(registry: &Registry, dest: &mut W) -> IoResult<()> where W: Wr
     Ok(())
 }
 
+/// Creates a stub structure.
+///
+/// The name of the struct corresponds to the namespace.
+fn write_struct<W>(ns: &Ns, dest: &mut W) -> IoResult<()> where W: Writer {
+    writeln!(dest, "
+        #[allow(non_camel_case_types)]
+        #[allow(non_snake_case)]
+        #[allow(dead_code)]
+        #[stable]
+        pub struct {ns};
+        ",
+
+        ns = ns.fmt_struct_name(),
+    )
+}
+
+/// Creates the `impl` of the structure created by `write_struct`.
+fn write_impl<W>(registry: &Registry, ns: &Ns, dest: &mut W) -> IoResult<()> where W: Writer {
+    writeln!(dest, "
+        impl {ns} {{
+            /// Stub function.
+            #[unstable]
+            #[allow(dead_code)]
+            pub fn load_with<F>(_loadfn: F) -> {ns} where F: Fn(&str) -> *const __gl_imports::libc::c_void {{
+                {ns}
+            }}
+
+            {modules}
+        }}",
+
+        ns = ns.fmt_struct_name(),
+
+        modules = registry.cmd_iter().map(|c| {
+            format!(
+                "#[allow(non_snake_case)]
+                // #[allow(unused_variables)]
+                #[allow(dead_code)]
+                #[inline]
+                #[unstable]
+                pub unsafe fn {name}(&self, {typed_params}) -> {return_suffix} {{
+                    {name}({idents})
+                }}",
+                name = c.proto.ident,
+                typed_params = super::gen_parameters(c, true, true).connect(", "),
+                return_suffix = super::gen_return_type(c),
+                idents = super::gen_parameters(c, true, false).connect(", "),
+            )
+        }).collect::<Vec<String>>().connect("\n")
+    )
+}
+
 /// Writes all functions corresponding to the GL bindings.
 ///
 /// These are foreign functions, they don't have any content.
@@ -78,7 +131,7 @@ fn write_fns<W>(registry: &Registry, ns: &Ns, dest: &mut W) -> IoResult<()> wher
     let symbols = registry.cmd_iter().map(|c| {
         format!(
             "#[link_name=\"{symbol}\"]
-            pub fn {name}({params}) -> {return_suffix};",
+            fn {name}({params}) -> {return_suffix};",
             symbol = super::gen_symbol_name(ns, c.proto.ident.as_slice()),
             name = c.proto.ident,
             params = super::gen_parameters(c, true, true).connect(", "),
@@ -91,7 +144,7 @@ fn write_fns<W>(registry: &Registry, ns: &Ns, dest: &mut W) -> IoResult<()> wher
         #[allow(unused_variables)]
         #[allow(dead_code)]
         extern \"system\" {{
-            {symbols}
+            {}
         }}
-    ", symbols = symbols)
+    ", symbols)
 }

@@ -42,7 +42,7 @@
 //! ~~~
 //!
 //! Calling a function that has not been loaded will result in a failure like:
-//! `fail!("gl::Viewport was not loaded")`, which aviods a segfault. This feature
+//! `panic!("gl::Viewport was not loaded")`, which aviods a segfault. This feature
 //! does not cause any run time overhead because the failing functions are
 //! assigned only when `load_with` is called.
 //!
@@ -54,7 +54,7 @@
 //! gl::TEXTURE_2D;
 //!
 //! // calling a function
-//! gl::DrawArrays(gl::TRIANGLES, 0, 3);
+//! unsafe { gl::DrawArrays(gl::TRIANGLES, 0, 3) };
 //!
 //! // functions that take pointers are unsafe
 //! # let shader = 0;
@@ -76,21 +76,6 @@
 //!
 
 #![crate_name = "gl"]
-#![comment = "An OpenGL function loader."]
-#![license = "ASL2"]
 #![crate_type = "lib"]
 
-#![feature(phase)]
-
-#[phase(plugin)]
-extern crate gl_generator;
-
-generate_gl_bindings! {
-    api: "gl",
-    profile: "core",
-    version: "4.5",
-    generator: "global",
-    extensions: [
-        "GL_EXT_texture_filter_anisotropic",
-    ],
-}
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

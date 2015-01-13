@@ -18,16 +18,35 @@
 extern crate collections;
 extern crate xml;
 
-use self::collections::TreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::BTreeSet;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
-use std::from_str::FromStr;
-use std::slice::Items;
+use std::str::FromStr;
+use std::slice::Iter;
 
-use self::xml::reader::events;
+use self::xml::attribute::OwnedAttribute;
+use self::xml::reader::events::XmlEvent;
 
+use self::Ns::{Gl, Glx, Wgl, Egl, Gles1, Gles2};
+
+#[derive(Copy)]
 pub enum Ns { Gl, Glx, Wgl, Egl, Gles1, Gles2 }
+
+impl Ns {
+    pub fn fmt_struct_name(&self) -> &str {
+        match *self {
+            Gl  => "Gl",
+            Glx => "Glx",
+            Wgl => "Wgl",
+            Egl => "Egl",
+            Gles1 => "Gles1",
+            Gles2 => "Gles2",
+        }
+    }
+}
 
 impl FromStr for Ns {
     fn from_str(s: &str) -> Option<Ns> {
@@ -43,7 +62,7 @@ impl FromStr for Ns {
     }
 }
 
-impl fmt::Show for Ns {
+impl fmt::String for Ns {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Gl  => write!(fmt, "gl"),
@@ -52,19 +71,6 @@ impl fmt::Show for Ns {
             Egl => write!(fmt, "egl"),
             Gles1 => write!(fmt, "gles1"),
             Gles2 => write!(fmt, "gles2"),
-        }
-    }
-}
-
-impl fmt::Char for Ns {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Gl  => write!(fmt, "Gl"),
-            Glx => write!(fmt, "Glx"),
-            Wgl => write!(fmt, "Wgl"),
-            Egl => write!(fmt, "Egl"),
-            Gles1 => write!(fmt, "Gles1"),
-            Gles2 => write!(fmt, "Gles2"),
         }
     }
 }
@@ -91,12 +97,22 @@ fn trim_cmd_prefix<'a>(ident: &'a str, ns: Ns) -> &'a str {
     }
 }
 
+fn merge_map(a: &mut HashMap<String, Vec<String>>, b: HashMap<String, Vec<String>>) {
+    for (k, v) in b.into_iter() {
+        match a.entry(k) {
+            Entry::Occupied(mut ent) => { ent.get_mut().extend(v.into_iter()); },
+            Entry::Vacant(ent) => { ent.insert(v); }
+        }
+    }
+}
+
 pub struct Registry {
     pub groups: Vec<Group>,
     pub enums: Vec<Enum>,
     pub cmds: Vec<Cmd>,
     pub features: Vec<Feature>,
     pub extensions: Vec<Extension>,
+    pub aliases: HashMap<String, Vec<String>>,
 }
 
 impl Registry {
@@ -114,8 +130,8 @@ impl Registry {
 
     /// Returns a set of all the types used in the supplied registry. This is useful
     /// for working out what conversions are needed for the specific registry.
-    pub fn get_tys(&self) -> TreeSet<String> {
-        let mut tys = TreeSet::new();
+    pub fn get_tys(&self) -> BTreeSet<String> {
+        let mut tys = BTreeSet::new();
         for def in self.cmds.iter() {
             tys.insert(def.proto.ty.clone());
             for param in def.params.iter() {
@@ -142,10 +158,12 @@ impl Registry {
 
 pub struct EnumIterator<'a> {
     seen: HashSet<String>,
-    iter: Items<'a, Enum>,
+    iter: Iter<'a, Enum>,
 }
 
-impl<'a> Iterator<&'a Enum> for EnumIterator<'a> {
+impl<'a> Iterator for EnumIterator<'a> {
+    type Item = &'a Enum;
+
     fn next(&mut self) -> Option<&'a Enum> {
         self.iter.next().and_then(|def| {
             if !self.seen.contains(&def.ident) {
@@ -160,10 +178,12 @@ impl<'a> Iterator<&'a Enum> for EnumIterator<'a> {
 
 pub struct CmdIterator<'a> {
     seen: HashSet<String>,
-    iter: Items<'a, Cmd>,
+    iter: Iter<'a, Cmd>,
 }
 
-impl<'a> Iterator<&'a Cmd> for CmdIterator<'a> {
+impl<'a> Iterator for CmdIterator<'a> {
+    type Item = &'a Cmd;
+
     fn next(&mut self) -> Option<&'a Cmd> {
         self.iter.next().and_then(|def| {
             if !self.seen.contains(&def.proto.ident) {
@@ -213,13 +233,16 @@ pub struct Binding {
 pub struct Cmd {
     pub proto: Binding,
     pub params: Vec<Binding>,
+    /// True if this command doesn't take any pointers.
+    ///
+    /// Unused by the built-in generators.
     pub is_safe: bool,
     pub alias: Option<String>,
     pub vecequiv: Option<String>,
     pub glx: Option<GlxOpcode>,
 }
 
-#[deriving(Clone)]
+#[derive(Clone)]
 pub struct Feature {
     pub api: String,
     pub name: String,
@@ -228,7 +251,7 @@ pub struct Feature {
     pub removes: Vec<Remove>,
 }
 
-#[deriving(Clone)]
+#[derive(Clone)]
 pub struct Require {
     pub comment: Option<String>,
     /// A reference to the earlier types, by name
@@ -237,7 +260,7 @@ pub struct Require {
     pub commands: Vec<String>,
 }
 
-#[deriving(Clone)]
+#[derive(Clone)]
 pub struct Remove {
     // always core, for now
     pub profile: String,
@@ -248,7 +271,7 @@ pub struct Remove {
     pub commands: Vec<String>,
 }
 
-#[deriving(Clone)]
+#[derive(Clone)]
 pub struct Extension {
     pub name: String,
     /// which apis this extension is defined for (see Feature.api)
@@ -277,15 +300,15 @@ pub struct Filter {
 }
 
 /// A big, ugly, imperative impl with methods that accumulates a Registry struct
-impl<'a, R: Buffer> RegistryBuilder<R> {
-    fn recv(&self) -> events::XmlEvent {
+impl<R: Buffer> RegistryBuilder<R> {
+    fn recv(&self) -> XmlEvent {
         for event in self.port.borrow_mut().events() {
             match event {
-                events::StartDocument{..} => (),
-                events::Comment(_) => (),
-                events::Whitespace(_) => (),
-                events::EndDocument => fail!("The end of the document has been reached"),
-                events::Error(err) => fail!("XML error: {}", err),
+                XmlEvent::StartDocument{..} => (),
+                XmlEvent::Comment(_) => (),
+                XmlEvent::Whitespace(_) => (),
+                XmlEvent::EndDocument => panic!("The end of the document has been reached"),
+                XmlEvent::Error(err) => panic!("XML error: {:?}", err),
                 event => return event,
             }
         }
@@ -295,31 +318,31 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
 
     fn expect_characters(&self) -> String {
         match self.recv() {
-            events::Characters(ref ch) => ch.clone(),
-            msg => fail!("Expected characters, found: {}", msg.to_string()),
+            XmlEvent::Characters(ref ch) => ch.clone(),
+            msg => panic!("Expected characters, found: {:?}", msg),
         }
     }
 
-    fn expect_start_element(&self, n: &str) -> Vec<xml::common::Attribute> {
+    fn expect_start_element(&self, n: &str) -> Vec<OwnedAttribute> {
         match self.recv() {
-            events::StartElement{ref name, ref attributes, ..}
+            XmlEvent::StartElement{ref name, ref attributes, ..}
                 if n == name.local_name.as_slice() => attributes.clone(),
-            msg => fail!("Expected <{}>, found: {}", n, msg.to_string()),
+            msg => panic!("Expected <{}>, found: {:?}", n, msg),
         }
     }
 
     fn expect_end_element(&self, n: &str) {
         match self.recv() {
-            events::EndElement{ref name} if n == name.local_name.as_slice() => (),
-            msg => fail!("Expected </{}>, found: {}", n, msg.to_string()),
+            XmlEvent::EndElement{ref name} if n == name.local_name.as_slice() => (),
+            msg => panic!("Expected </{}>, found: {:?}", n, msg),
         }
     }
 
-    fn skip_until(&self, event: events::XmlEvent) {
+    fn skip_until(&self, event: XmlEvent) {
         loop {
             match self.recv() {
-                events::EndDocument => fail!("Expected {}, but reached the end of the document.",
-                                     event.to_string()),
+                XmlEvent::EndDocument => panic!("Expected {:?}, but reached the end of the document.",
+                                     event),
                 ref msg if *msg == event => break,
                 _ => (),
             }
@@ -334,77 +357,80 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
             cmds: Vec::new(),
             features: Vec::new(),
             extensions: Vec::new(),
+            aliases: HashMap::new(),
         };
 
         loop {
             match self.recv() {
                 // ignores
-                events::Characters(_) | events::Comment(_) => (),
-                events::StartElement{ref name, ..}
+                XmlEvent::Characters(_) | XmlEvent::Comment(_) => (),
+                XmlEvent::StartElement{ref name, ..}
                     if name.local_name.as_slice() == "comment" =>
-                        self.skip_until(events::EndElement { name: name.clone() }),
-                events::StartElement{ref name, ..}
+                        self.skip_until(XmlEvent::EndElement { name: name.clone() }),
+                XmlEvent::StartElement{ref name, ..}
                     if name.local_name.as_slice() == "types" =>
-                        self.skip_until(events::EndElement { name: name.clone() }),
+                        self.skip_until(XmlEvent::EndElement { name: name.clone() }),
 
                 // add groups
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "groups" => {
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "groups" => {
                     loop {
                         match self.recv() {
-                            events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "group" => {
+                            XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "group" => {
                                 registry.groups.push(
                                     self.consume_group(get_attribute(attributes.as_slice(), "name").unwrap())
                                 );
                             }
-                            events::EndElement{ref name} if name.local_name.as_slice() == "groups" => break,
-                            msg => fail!("Expected </groups>, found: {}", msg.to_string()),
+                            XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "groups" => break,
+                            msg => panic!("Expected </groups>, found: {:?}", msg),
                         }
                     }
                 }
 
                 // add enum namespace
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "enums" => {
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "enums" => {
                     registry.enums.extend(self.consume_enums().into_iter());
                 }
 
                 // add command namespace
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "commands" => {
-                    registry.cmds.extend(self.consume_cmds().into_iter());
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "commands" => {
+                    let (cmds, aliases) = self.consume_cmds();
+                    registry.cmds.extend(cmds.into_iter());
+                    merge_map(&mut registry.aliases, aliases);
                 }
 
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "feature" => {
-                    debug!("Parsing feature: {}", attributes.as_slice());
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "feature" => {
+                    debug!("Parsing feature: {:?}", attributes);
                     registry.features.push(FromXML::convert(self, attributes.as_slice()));
                 }
 
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "extensions" => {
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "extensions" => {
                     loop {
                         match self.recv() {
-                            events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "extension" => {
+                            XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "extension" => {
                                 registry.extensions.push(FromXML::convert(self, attributes.as_slice()));
                             }
-                            events::EndElement{ref name} if name.local_name.as_slice() == "extensions" => break,
-                            msg => fail!("Unexpected message {}", msg.to_string()),
+                            XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "extensions" => break,
+                            msg => panic!("Unexpected message {:?}", msg),
                         }
                     }
                 }
 
                 // finished building the registry
-                events::EndElement{ref name} if name.local_name.as_slice() == "registry" => break,
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "registry" => break,
 
                 // error handling
-                msg => fail!("Expected </registry>, found: {}", msg.to_string()),
+                msg => panic!("Expected </registry>, found: {:?}", msg),
             }
         }
 
         match self.filter {
             Some(ref filter) => {
                 let Registry {
-                    groups, enums, cmds, features: feats, extensions: exts
+                    groups, enums, cmds, aliases, features: feats, extensions: exts,
                 } = registry;
 
-                let mut desired_enums = HashSet::new();
-                let mut desired_cmds = HashSet::new();
+                let mut desired_enums: HashSet<String> = HashSet::new();
+                let mut desired_cmds: HashSet<String> = HashSet::new();
 
                 // find the features we want
                 let mut found_feat = false;
@@ -441,13 +467,13 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                 }
 
                 if !found_feat {
-                    fail!("Did not find version {} in the registry", filter.version);
+                    panic!("Did not find version {} in the registry", filter.version);
                 }
 
                 for ext in exts.iter() {
                     if filter.extensions.iter().any(|x| x == &ext.name) {
                         if !ext.supported.iter().any(|x| x == &filter.api) {
-                            fail!("Requested {}, which doesn't support the {} API", ext.name, filter.api);
+                            panic!("Requested {}, which doesn't support the {} API", ext.name, filter.api);
                         }
                         for req in ext.requires.iter() {
                             desired_enums.extend(req.enums.iter().map(|x| x.clone()));
@@ -473,6 +499,7 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                     // these aren't important after this step
                     features: Vec::new(),
                     extensions: Vec::new(),
+                    aliases: aliases,
                 }
             },
             None => registry
@@ -480,15 +507,15 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
     }
 
     fn consume_two<'a, T: FromXML, U: FromXML>(&self, one: &'a str, two: &'a str, end: &'a str) -> (Vec<T>, Vec<U>) {
-        debug!("consume_two: looking for {:s} and {:s} until {:s}", one, two, end);
+        debug!("consume_two: looking for {} and {} until {}", one, two, end);
 
         let mut ones = Vec::new();
         let mut twos = Vec::new();
 
         loop {
             match self.recv() {
-                events::StartElement{ref name, ref attributes, ..} => {
-                    debug!("Found start element <{} {}>", name, attributes.as_slice());
+                XmlEvent::StartElement{ref name, ref attributes, ..} => {
+                    debug!("Found start element <{:?} {:?}>", name, attributes);
                     debug!("one and two are {} and {}", one, two);
 
                     let n = name.clone();
@@ -504,11 +531,11 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                     } else if two == n.local_name.as_slice() {
                         twos.push(FromXML::convert(self, attributes.as_slice()));
                     } else {
-                        fail!("Unexpected element: <{} {}>", n, attributes.as_slice());
+                        panic!("Unexpected element: <{:?} {:?}>", n, attributes.as_slice());
                     }
                 },
-                events::EndElement{ref name} => {
-                    debug!("Found end element </{}>", name);
+                XmlEvent::EndElement{ref name} => {
+                    debug!("Found end element </{:?}>", name);
 
                     if (&[one, two]).iter().any(|&x| x == name.local_name.as_slice()) {
                         continue;
@@ -521,10 +548,10 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                     } else if end == name.local_name.as_slice() {
                         return (ones, twos);
                     } else {
-                        fail!("Unexpected end element {}", name.local_name);
+                        panic!("Unexpected end element {:?}", name.local_name);
                     }
                 },
-                msg => fail!("Unexpected message {}", msg.to_string()) }
+                msg => panic!("Unexpected message {:?}", msg) }
         }
     }
 
@@ -532,12 +559,12 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
         let mut enms = Vec::new();
         loop {
             match self.recv() {
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "enum" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "enum" => {
                     enms.push(get_attribute(attributes.as_slice(), "name").unwrap());
                     self.expect_end_element("enum");
                 }
-                events::EndElement{ref name} if name.local_name.as_slice() == "group" => break,
-                msg => fail!("Expected </group>, found: {}", msg.to_string()),
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "group" => break,
+                msg => panic!("Expected </group>, found: {:?}", msg),
             }
         }
         Group {
@@ -551,12 +578,12 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
         loop {
             match self.recv() {
                 // ignores
-                events::Characters(_) | events::Comment(_) => (),
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "unused" =>
-                    self.skip_until(events::EndElement{name: name.clone()}),
+                XmlEvent::Characters(_) | XmlEvent::Comment(_) => (),
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "unused" =>
+                    self.skip_until(XmlEvent::EndElement{name: name.clone()}),
 
                 // add enum definition
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "enum" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "enum" => {
                     enums.push(
                         Enum {
                             ident:  trim_enum_prefix(get_attribute(attributes.as_slice(), "name").unwrap().as_slice(), self.ns).to_string(),
@@ -569,29 +596,40 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                 }
 
                 // finished building the namespace
-                events::EndElement{ref name} if name.local_name.as_slice() == "enums" => break,
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "enums" => break,
                 // error handling
-                msg => fail!("Expected </enums>, found: {}", msg.to_string()),
+                msg => panic!("Expected </enums>, found: {:?}", msg),
             }
         }
         enums
     }
 
-    fn consume_cmds(&self) -> Vec<Cmd> {
+    fn consume_cmds(&self) -> (Vec<Cmd>, HashMap<String, Vec<String>>) {
         let mut cmds = Vec::new();
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
         loop {
             match self.recv() {
                 // add command definition
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "command" => {
-                    cmds.push(self.consume_cmd());
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "command" => {
+                    let new = self.consume_cmd();
+                    match new.alias {
+                        Some(ref v) => {
+                            match aliases.entry(v.clone()) {
+                                Entry::Occupied(mut ent) => { ent.get_mut().push(new.proto.ident.clone()); },
+                                Entry::Vacant(ent) => { ent.insert(vec![new.proto.ident.clone()]); }
+                            }
+                        },
+                        None => { }
+                    }
+                    cmds.push(new);
                 }
                 // finished building the namespace
-                events::EndElement{ref name} if name.local_name.as_slice() == "commands" => break,
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "commands" => break,
                 // error handling
-                msg => fail!("Expected </commands>, found: {}", msg.to_string()),
+                msg => panic!("Expected </commands>, found: {:?}", msg),
             }
         }
-        cmds
+        (cmds, aliases)
     }
 
     fn consume_cmd(&self) -> Cmd {
@@ -606,20 +644,21 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
         let mut glx = None;
         loop {
             match self.recv() {
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "param" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "param" => {
                     params.push(
                         self.consume_binding("param", get_attribute(attributes.as_slice(), "group"))
                     );
                 }
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "alias" => {
-                    alias = get_attribute(attributes.as_slice(), "alias");
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "alias" => {
+                    alias = get_attribute(attributes.as_slice(), "name");
+                    alias = alias.map(|t| trim_cmd_prefix(t.as_slice(), self.ns).to_string());
                     self.expect_end_element("alias");
                 }
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "vecequiv" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "vecequiv" => {
                     vecequiv = get_attribute(attributes.as_slice(), "vecequiv");
                     self.expect_end_element("vecequiv");
                 }
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "glx" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "glx" => {
                     glx = Some(GlxOpcode {
                         ty:      get_attribute(attributes.as_slice(), "type").unwrap(),
                         opcode:  get_attribute(attributes.as_slice(), "opcode").unwrap(),
@@ -628,8 +667,8 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
                     });
                     self.expect_end_element("glx");
                 }
-                events::EndElement{ref name} if name.local_name.as_slice() == "command" => break,
-                msg => fail!("Expected </command>, found: {}", msg.to_string()),
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "command" => break,
+                msg => panic!("Expected </command>, found: {:?}", msg),
             }
         }
         let is_safe = params.len() <= 0 || params.iter().all(|p| !p.ty.as_slice().contains_char('*'));
@@ -649,11 +688,11 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
         let mut ty = String::new();
         loop {
             match self.recv() {
-                events::Characters(ch) => ty.push_str(ch.as_slice()),
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "ptype" => (),
-                events::EndElement{ref name} if name.local_name.as_slice() == "ptype" => (),
-                events::StartElement{ref name, ..} if name.local_name.as_slice() == "name" => break,
-                msg => fail!("Expected binding, found: {}", msg.to_string()),
+                XmlEvent::Characters(ch) => ty.push_str(ch.as_slice()),
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "ptype" => (),
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "ptype" => (),
+                XmlEvent::StartElement{ref name, ..} if name.local_name.as_slice() == "name" => break,
+                msg => panic!("Expected binding, found: {:?}", msg),
             }
         }
 
@@ -664,9 +703,9 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
         // consume the type suffix
         loop {
             match self.recv() {
-                events::Characters(ch) => ty.push_str(ch.as_slice()),
-                events::EndElement{ref name} if name.local_name.as_slice() == outside_tag => break,
-                msg => fail!("Expected binding, found: {}", msg.to_string()),
+                XmlEvent::Characters(ch) => ty.push_str(ch.as_slice()),
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == outside_tag => break,
+                msg => panic!("Expected binding, found: {:?}", msg),
             }
         }
 
@@ -678,16 +717,16 @@ impl<'a, R: Buffer> RegistryBuilder<R> {
     }
 }
 
-fn get_attribute(a: &[xml::common::Attribute], name: &str) -> Option<String> {
+fn get_attribute(a: &[OwnedAttribute], name: &str) -> Option<String> {
     a.iter().find(|a| a.name.local_name.as_slice() == name).map(|e| e.value.clone())
 }
 
 trait FromXML {
-    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> Self;
+    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> Self;
 }
 
 impl FromXML for Require {
-    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> Require {
+    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> Require {
         debug!("Doing a FromXML on Require");
         let comment = get_attribute(a, "comment");
         let (enums, commands) = r.consume_two("enum", "command", "require");
@@ -700,7 +739,7 @@ impl FromXML for Require {
 }
 
 impl FromXML for Remove {
-    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> Remove {
+    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> Remove {
         debug!("Doing a FromXML on Remove");
         let profile = get_attribute(a, "profile").unwrap();
         let comment = get_attribute(a, "comment").unwrap();
@@ -716,13 +755,13 @@ impl FromXML for Remove {
 }
 
 impl FromXML for Feature {
-    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> Feature {
+    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> Feature {
         debug!("Doing a FromXML on Feature");
         let api      = get_attribute(a, "api").unwrap();
         let name     = get_attribute(a, "name").unwrap();
         let number   = get_attribute(a, "number").unwrap();
 
-        debug!("Found api = {:s}, name = {:s}, number = {:s}", api, name, number);
+        debug!("Found api = {}, name = {}, number = {}", api, name, number);
 
         let (require, remove) = r.consume_two("require", "remove", "feature");
 
@@ -737,18 +776,18 @@ impl FromXML for Feature {
 }
 
 impl FromXML for Extension {
-    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> Extension {
+    fn convert<R: Buffer>(r: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> Extension {
         debug!("Doing a FromXML on Extension");
         let name = get_attribute(a, "name").unwrap();
         let supported = get_attribute(a, "supported").unwrap().as_slice().split('|').map(|x| x.to_string()).collect::<Vec<String>>();
         let mut require = Vec::new();
         loop {
             match r.recv() {
-                events::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "require" => {
+                XmlEvent::StartElement{ref name, ref attributes, ..} if name.local_name.as_slice() == "require" => {
                     require.push(FromXML::convert(r, attributes.as_slice()));
                 }
-                events::EndElement{ref name} if name.local_name.as_slice() == "extension" => break,
-                msg => fail!("Unexpected message {}", msg.to_string())
+                XmlEvent::EndElement{ref name} if name.local_name.as_slice() == "extension" => break,
+                msg => panic!("Unexpected message {:?}", msg)
             }
         }
 
@@ -761,7 +800,7 @@ impl FromXML for Extension {
 }
 
 impl FromXML for String {
-    fn convert<R: Buffer>(_: &RegistryBuilder<R>, a: &[xml::common::Attribute]) -> String {
+    fn convert<R: Buffer>(_: &RegistryBuilder<R>, a: &[OwnedAttribute]) -> String {
         get_attribute(a, "name").unwrap()
     }
 }

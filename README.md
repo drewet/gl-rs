@@ -29,14 +29,15 @@ context library, This is how it would look using [glfw-rs]
 ~~~rust
 // the supplied function must be of the type:
 // `&fn(symbol: &str) -> Option<extern "C" fn()>`
-gl::load_with(|s| glfw.get_proc_address(s));
+// `window` is a glfw::Window
+gl::load_with(|s| window.get_proc_address(s));
 
 // loading a specific function pointer
-gl::Viewport::load_with(|s| glfw.get_proc_address(s));
+gl::Viewport::load_with(|s| window.get_proc_address(s));
 ~~~
 
 Calling a function that has not been loaded will result in a failure like:
-`fail!("gl::Viewport was not loaded")`, which avoids a segfault. This feature
+`panic!("gl::Viewport was not loaded")`, which avoids a segfault. This feature
 does not cause any run time overhead because the failing functions are
 assigned only when `load_with` is called.
 
@@ -62,6 +63,12 @@ if gl::Viewport::is_loaded() {
 }
 ~~~
 
+## Extra features
+
+The global and struct generators will attempt to use fallbacks functions when
+they are available. For example, if `glGenFramebuffers` cannot be loaded it will
+also attempt to load `glGenFramebuffersEXT` as a fallback.
+
 ## Using gl_generator
 
 If you need a specific version of OpenGL, or you need a different API
@@ -74,51 +81,78 @@ custom gfx-rs loader for a project.
 Add this to your `Cargo.toml`:
 
 ~~~toml
-[dependencies.gl_generator]
-git = "https://github.com/bjz/gl-rs"
+[build-dependencies]
+gl_generator = "*"
+
+[dependencies]
+gl_common = "*"
+~~~
+
+Under the `[package]` section, add:
+
+~~~toml
+build = "build.rs"
+~~~
+
+Create a `build.rs` to pull your specific version/API:
+
+~~~rust
+extern crate gl_generator;    // <-- this is your build dependency
+extern crate khronos_api;    // included by gl_generator
+
+use std::os;
+use std::io::File;
+
+fn main() {
+    let dest = Path::new(os::getenv("OUT_DIR").unwrap());
+
+    let mut file = File::create(&dest.join("gl_bindings.rs")).unwrap();
+
+    // This generates bindsings for OpenGL ES v3.1
+    gl_generator::generate_bindings(gl_generator::GlobalGenerator,
+                                    gl_generator::registry::Ns::Gles2,
+                                    khronos_api::GL_XML,
+                                    vec![],
+                                    "3.1", "core", &mut file).unwrap();
+}
 ~~~
 
 Then use it like this:
 
 ~~~rust
-#[phase(plugin)]
-extern crate gl_generator;
-extern crate libc;
+mod gles {
+    include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
 
-use std::mem;
-use self::types::*;
-
-generate_gl_bindings! {
-    api: gl,
-    profile: core,
-    version: 4.5,
-    generator: global,
-    extensions: [
-        GL_EXT_texture_filter_anisotropic,
-    ],
+/*
+ * Simple loading example
+ */
+fn main() {
+    // Assuming window is GLFW, initialized, and made current
+    gles::load_with(|s| window.get_proc_address(s));
 }
 ~~~
 
-The `generate_gl_bindings` macro will generate all the OpenGL functions,
-plus all enumerations, plus all types in the `types` submodule.
+The `build.rs` file will generate all the OpenGL functions in a file named,
+`gl_bindings.rs` plus all enumerations, and all types in the `types` submodule.
 
 ### Arguments
 
-Each field can be specified at most once, or not at all. If the field is not
-specified, then a default value will be used.
-
-- `api`: The API to generate. Can be either `"gl"`, `"gles1"`, `"gles2"`,
-  `"wgl"`, `"glx"`, `"egl"`. Defaults to `"gl"`.
-- `profile`: Can be either `"core"` or `"compatibility"`. Defaults to
-  `"core"`. `"core"` will only include all functions supported by the
+- The type of loader to generate. Can be 
+  `gl_generator::StaticGenerator`, `gl_generator::StaticStructGenerator`,
+  `gl_generator::StructGenerator`, or `gl_generator::GlobalGenerator`.
+- The API to generate. Can be `Gl`, `Gles1`, `Gles2`
+  (GLES 2 or 3), `Wgl`, `Glx`, `Egl`.
+- The file which contains the bindings to parse. Can be `GL_XML` (for GL
+  and GL ES), `GLX_XML`, `WGL_XML`, `EGL_XML`.
+- Extra extensions to include in the bindings. These are
+  specified as a list of strings.
+- The requested API version. This is usually in the form
+  `"major.minor"`.
+- The GL profile. Can be either `"core"` or `"compatibility"`. `"core"` will
+  only include all functions supported by the
   requested version it self, while `"compatibility"` will include all the
   functions from previous versions as well.
-- `version`: The requested API version. This is usually in the form
-  `"major.minor"`. Defaults to `"1.0"`
-- `generator`: The type of loader to generate. Can be either `"static"`,
-  `"global"`, or `"struct"`. Defaults to `"static"`.
-- `extensions`: Extra extensions to include in the bindings. These are
-  specified as a list of strings. Defaults to `[]`.
 
 ## Generator types
 
@@ -134,6 +168,8 @@ The struct generator is a cleaner alternative to the global generator.
 The main difference is that you must call `gl::Gl::load_with` instead of
 `gl::load_with`, and this functions returns a struct of type `Gl`. The OpenGL
 functions are not static functions but member functions in this `Gl` struct.
+This is important when the GL functions are associated with the current
+context, as is true on Windows.
 
 The enumerations and types are still static and available in a similar way as
 in the global generator.
@@ -153,3 +189,12 @@ implementations for these APIs.
 You will need to manually provide the linkage. For example to use WGL or
 OpenGL 1.1 on Windows, you will need to add
 `#[link="OpenGL32.lib"] extern {}` somewhere in your code.
+
+### Custom Generators
+
+The `gl_generator` crate is extensible. This is a niche feature useful only in
+very rare cases. To create a custom generator, [create a new plugin
+crate](http://doc.rust-lang.org/guide-plugin.html#syntax-extensions) which
+depends on `gl_generator`. Then, implement the `gl_generator::Generator` trait
+and in your plugin registrar, register a function which calls
+`gl_generator::generate_bindings` with your custom generator and its name.
